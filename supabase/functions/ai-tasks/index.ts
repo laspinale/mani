@@ -65,6 +65,7 @@ serve(async (req) => {
     if (body.action === "create") {
       const row = {
         title: body.title,
+        description: body.description ?? null,
         agent: body.agent_emoji || body.agent_name || "🤖",
         priority: body.priority,
         status: COLUMN_MAP[String(body.column || "to_do").toLowerCase()] || "todo",
@@ -94,15 +95,62 @@ serve(async (req) => {
   }
 
   if (body.request_type === "assignee") {
-    return ok({ ok: true, note: "Assignee flow scaffolded but backing tables are not implemented yet." });
+    if (body.action === "assign") {
+      const rows = (body.names || []).map((name: string) => ({ task_id: body.task_id, name }));
+      const { data, error } = await supabase.from("task_assignees").upsert(rows, { onConflict: "task_id,name" }).select("*");
+      if (error) return fail(error.message, 500);
+      return ok({ assignees: data ?? [] });
+    }
+
+    if (body.action === "unassign") {
+      const names = body.names || [];
+      let query = supabase.from("task_assignees").delete().eq("task_id", body.task_id);
+      if (names.length) query = query.in("name", names);
+      const { error } = await query;
+      if (error) return fail(error.message, 500);
+      return ok({ ok: true });
+    }
+
+    if (body.action === "list") {
+      const { data, error } = await supabase.from("task_assignees").select("*").eq("task_id", body.task_id);
+      if (error) return fail(error.message, 500);
+      return ok({ assignees: data ?? [] });
+    }
   }
 
   if (body.request_type === "subtask") {
-    return ok({ ok: true, note: "Subtask flow scaffolded but backing tables are not implemented yet." });
+    if (body.action === "create") {
+      const { data, error } = await supabase.from("task_subtasks").insert({ task_id: body.task_id, title: body.title, completed: !!body.completed }).select("*").single();
+      if (error) return fail(error.message, 500);
+      return ok({ subtask: data }, 201);
+    }
+
+    if (body.action === "update") {
+      const { data, error } = await supabase.from("task_subtasks").update({ completed: !!body.completed, title: body.title }).eq("id", body.subtask_id).select("*").single();
+      if (error) return fail(error.message, 500);
+      return ok({ subtask: data });
+    }
+
+    if (body.action === "delete") {
+      const { error } = await supabase.from("task_subtasks").delete().eq("id", body.subtask_id);
+      if (error) return fail(error.message, 500);
+      return ok({ ok: true });
+    }
   }
 
   if (body.request_type === "question") {
-    return ok({ ok: true, note: "Question flow scaffolded but backing tables are not implemented yet." });
+    if (body.action === "ask") {
+      const { data, error } = await supabase.from("task_questions").insert({
+        related_task_id: body.related_task_id ?? null,
+        question_type: body.question_type ?? "question",
+        priority: body.priority ?? "Medium",
+        question: body.question,
+        agent_name: body.agent_name ?? null,
+        agent_emoji: body.agent_emoji ?? null,
+      }).select("*").single();
+      if (error) return fail(error.message, 500);
+      return ok({ question: data }, 201);
+    }
   }
 
   return fail("Unsupported request", 400);
