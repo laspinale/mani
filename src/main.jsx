@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { format, isAfter, parseISO, subDays } from "date-fns";
 import DOMPurify from "dompurify";
@@ -32,6 +32,7 @@ import {
   YAxis,
 } from "recharts";
 import "./styles.css";
+import { supabase } from "./lib/supabase";
 
 const agents = [
   { name: "Agent Alpha", emoji: "🤖", type: "Code Agent", role: "Lead Engineer", accent: "#10b981", status: "active", activity: "Refactoring task queue", lastSeen: "just now", tasksCompleted: 128, accuracy: 98.4, skills: ["TypeScript", "Architecture", "Reviews"] },
@@ -100,7 +101,7 @@ const meetingTypes = {
   allhands: "#22c55e",
 };
 
-const meetings = [
+const mockMeetings = [
   { type: "meeting", title: "Weekly Standup with Engineering", date: "2026-02-25T10:00:00Z", duration_minutes: 30, duration_display: "30m", attendees: ["Alice", "Bob", "Charlie"], summary: "Discussed sprint progress. Backend API 80% complete.", action_items: [{ task: "Review PR #42", assignee: "Alice", done: false }, { task: "Update docs", assignee: "Bob", done: true }], ai_insights: "30 minute standup with 3 attendees.", meeting_type: "standup", sentiment: "positive", has_external_participants: false, external_domains: [], fathom_url: null, share_url: null },
   { type: "meeting", title: "Customer Expansion Call", date: "2026-02-24T15:00:00Z", duration_minutes: 45, duration_display: "45m", attendees: ["Mia", "Jordan", "Nina"], summary: "Reviewed renewal path and implementation milestones.", action_items: [{ task: "Send proposal revision", assignee: "Mia", done: false }], ai_insights: "High intent external sales call.", meeting_type: "sales", sentiment: "positive", has_external_participants: true, external_domains: ["acme.com"], fathom_url: null, share_url: null },
   { type: "meeting", title: "Product Planning Session", date: "2026-02-20T09:00:00Z", duration_minutes: 60, duration_display: "1h", attendees: ["Sam", "Taylor", "Riley", "Jordan"], summary: "Outlined Q2 goals, dependencies, and launch sequencing.", action_items: [{ task: "Finalize scope", assignee: "Taylor", done: false }, { task: "Draft timeline", assignee: "Sam", done: false }], ai_insights: "Planning session with multiple owners.", meeting_type: "planning", sentiment: "neutral", has_external_participants: false, external_domains: [], fathom_url: null, share_url: null },
@@ -135,6 +136,15 @@ const tasks = {
   ],
 };
 
+function normalizeMeeting(meeting) {
+  return {
+    ...meeting,
+    action_items: Array.isArray(meeting.action_items) ? meeting.action_items : [],
+    attendees: Array.isArray(meeting.attendees) ? meeting.attendees : [],
+    external_domains: Array.isArray(meeting.external_domains) ? meeting.external_domains : [],
+  };
+}
+
 function App() {
   const [tab, setTab] = useState("deck");
   const [logFilter, setLogFilter] = useState("all");
@@ -145,8 +155,43 @@ function App() {
   const [externalOnly, setExternalOnly] = useState(false);
   const [selectedTypes, setSelectedTypes] = useState(["standup", "sales", "1-on-1", "planning", "team", "external", "interview", "allhands"]);
   const [sortBy, setSortBy] = useState("recent");
-  const [selectedMeeting, setSelectedMeeting] = useState(meetings[0]);
+  const [meetings, setMeetings] = useState(mockMeetings);
+  const [meetingsSource, setMeetingsSource] = useState("mock");
+  const [selectedMeeting, setSelectedMeeting] = useState(mockMeetings[0] || null);
   const [dragging, setDragging] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadMeetings() {
+      if (!supabase) return;
+
+      const { data, error } = await supabase
+        .from("meetings")
+        .select("*")
+        .order("date", { ascending: false });
+
+      if (cancelled) return;
+
+      if (error || !Array.isArray(data) || data.length === 0) {
+        setMeetings(mockMeetings);
+        setMeetingsSource("mock");
+        setSelectedMeeting(mockMeetings[0] || null);
+        return;
+      }
+
+      const normalized = data.map(normalizeMeeting);
+      setMeetings(normalized);
+      setMeetingsSource("supabase");
+      setSelectedMeeting(normalized[0] || null);
+    }
+
+    loadMeetings();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const counts = useMemo(() => {
     const filtered = meetings.filter((m) => {
@@ -224,6 +269,7 @@ function App() {
         </div>
         <div className="agent-status">
           <span className="status-dot active" />
+          <span className="pill">Meetings: {meetingsSource}</span>
           <div>
             <strong>{agents[0].name}: Online</strong>
             <div>{agents[0].activity}</div>
@@ -470,7 +516,7 @@ function App() {
               <section className="meeting-layout">
                 <div className="glass-card panel meeting-list">
                   {filteredMeetings.map((meeting) => (
-                    <button key={meeting.title} className={`meeting-card ${selectedMeeting.title === meeting.title ? "active" : ""}`} onClick={() => setSelectedMeeting(meeting)}>
+                    <button key={meeting.title} className={`meeting-card ${selectedMeeting?.title === meeting.title ? "active" : ""}`} onClick={() => setSelectedMeeting(meeting)}>
                       <div className="meeting-main">
                         <span className="pill" style={{ background: `${meetingTypes[meeting.meeting_type]}22`, color: meetingTypes[meeting.meeting_type] }}>{meeting.meeting_type}</span>
                         <strong>{meeting.title}</strong>
@@ -493,20 +539,20 @@ function App() {
                 <div className="glass-card panel meeting-detail">
                   <div className="detail-head">
                     <div>
-                      <span className="pill" style={{ background: `${meetingTypes[selectedMeeting.meeting_type]}22`, color: meetingTypes[selectedMeeting.meeting_type] }}>{selectedMeeting.meeting_type}</span>
-                      <h3>{selectedMeeting.title}</h3>
-                      <div className="muted">{format(parseISO(selectedMeeting.date), "PPP p")} · {selectedMeeting.duration_display}</div>
+                      <span className="pill" style={{ background: `${meetingTypes[selectedMeeting?.meeting_type] || "#10b981"}22`, color: meetingTypes[selectedMeeting?.meeting_type] || "#10b981" }}>{selectedMeeting?.meeting_type}</span>
+                      <h3>{selectedMeeting?.title || "No meeting selected"}</h3>
+                      <div className="muted">{selectedMeeting ? `${format(parseISO(selectedMeeting.date), "PPP p")} · ${selectedMeeting.duration_display}` : "No meeting data available"}</div>
                     </div>
                     <div className="detail-actions">
                       <button className="secondary-btn">Open Recording</button>
                       <button className="secondary-btn">Share Link</button>
                     </div>
                   </div>
-                  <div className="summary" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(`<p>${selectedMeeting.summary}</p><p><strong>Sentiment:</strong> ${selectedMeeting.sentiment}</p>`) }} />
+                  <div className="summary" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(`<p>${selectedMeeting?.summary || ""}</p><p><strong>Sentiment:</strong> ${selectedMeeting?.sentiment || "unknown"}</p>`) }} />
                   <div>
                     <h4>Action Items</h4>
                     <div className="action-items">
-                      {selectedMeeting.action_items.map((item) => (
+                      {selectedMeeting?.action_items?.map((item) => (
                         <label key={item.task} className="action-item">
                           <input type="checkbox" defaultChecked={item.done} />
                           <span>{item.task} · {item.assignee}</span>
@@ -515,11 +561,11 @@ function App() {
                     </div>
                   </div>
                   <div className="insight">
-                    <Sparkles size={16} /> {selectedMeeting.ai_insights}
+                    <Sparkles size={16} /> {selectedMeeting?.ai_insights || "No AI insights available yet."}
                   </div>
                   <div>
                     <h4>Attendees</h4>
-                    <div className="chips">{selectedMeeting.attendees.map((a) => <span className="chip" key={a}>{a}</span>)}</div>
+                    <div className="chips">{selectedMeeting?.attendees?.map((a) => <span className="chip" key={a}>{a}</span>)}</div>
                   </div>
                   <div className="footer-actions">
                     <label className="select-wrap">
