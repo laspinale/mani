@@ -115,26 +115,42 @@ const mockMeetings = [
   { type: "meeting", title: "Standup: Platform", date: "2026-02-05T09:30:00Z", duration_minutes: 15, duration_display: "15m", attendees: ["Platform", "Infra", "QA"], summary: "Quick update on deployment status and alerts.", action_items: [{ task: "Investigate alert spike", assignee: "QA", done: false }], ai_insights: "Short operational check-in.", meeting_type: "standup", sentiment: "neutral", has_external_participants: false, external_domains: [], fathom_url: null, share_url: null },
 ];
 
-const tasks = {
+const mockTasks = {
   todo: [
-    { title: "Draft onboarding checklist", agent: "📋", priority: "medium" },
-    { title: "Audit security logging", agent: "🛡️", priority: "high" },
-    { title: "Create release summary", agent: "🤖", priority: "low" },
+    { title: "Draft onboarding checklist", agent: "📋", priority: "medium", status: "todo" },
+    { title: "Audit security logging", agent: "🛡️", priority: "high", status: "todo" },
+    { title: "Create release summary", agent: "🤖", priority: "low", status: "todo" },
   ],
   doing: [
-    { title: "Refactor task assignment flow", agent: "🤖", priority: "urgent", progress: 72 },
-    { title: "Sync council transcript", agent: "📋", priority: "medium", progress: 44 },
+    { title: "Refactor task assignment flow", agent: "🤖", priority: "urgent", progress: 72, status: "doing" },
+    { title: "Sync council transcript", agent: "📋", priority: "medium", progress: 44, status: "doing" },
   ],
   needsInput: [
-    { title: "Clarify KPI target for Q3", agent: "📋", priority: "high" },
-    { title: "Approve policy exception", agent: "🛡️", priority: "urgent" },
+    { title: "Clarify KPI target for Q3", agent: "📋", priority: "high", status: "needsInput" },
+    { title: "Approve policy exception", agent: "🛡️", priority: "urgent", status: "needsInput" },
   ],
   done: [
-    { title: "Ship dashboard metrics", agent: "🤖", priority: "low" },
-    { title: "Summarize last meetings", agent: "🛡️", priority: "medium" },
-    { title: "Rebalance task queue", agent: "📋", priority: "medium" },
+    { title: "Ship dashboard metrics", agent: "🤖", priority: "low", status: "done" },
+    { title: "Summarize last meetings", agent: "🛡️", priority: "medium", status: "done" },
+    { title: "Rebalance task queue", agent: "📋", priority: "medium", status: "done" },
   ],
 };
+
+const emptyTaskColumns = {
+  todo: [],
+  doing: [],
+  needsInput: [],
+  done: [],
+};
+
+function normalizeTasks(rows) {
+  return rows.reduce((acc, task) => {
+    const status = task.status;
+    if (!acc[status]) acc[status] = [];
+    acc[status].push(task);
+    return acc;
+  }, { ...emptyTaskColumns });
+}
 
 function normalizeMeeting(meeting) {
   return {
@@ -158,35 +174,46 @@ function App() {
   const [meetings, setMeetings] = useState(mockMeetings);
   const [meetingsSource, setMeetingsSource] = useState("mock");
   const [selectedMeeting, setSelectedMeeting] = useState(mockMeetings[0] || null);
+  const [tasks, setTasks] = useState(mockTasks);
+  const [tasksSource, setTasksSource] = useState("mock");
   const [dragging, setDragging] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
 
-    async function loadMeetings() {
+    async function loadData() {
       if (!supabase) return;
 
-      const { data, error } = await supabase
-        .from("meetings")
-        .select("*")
-        .order("date", { ascending: false });
+      const [meetingsRes, tasksRes] = await Promise.all([
+        supabase.from("meetings").select("*").order("date", { ascending: false }),
+        supabase.from("tasks").select("*").order("sort_order", { ascending: true }),
+      ]);
 
       if (cancelled) return;
 
-      if (error || !Array.isArray(data) || data.length === 0) {
+      const { data: meetingsData, error: meetingsError } = meetingsRes;
+      if (meetingsError || !Array.isArray(meetingsData) || meetingsData.length === 0) {
         setMeetings(mockMeetings);
         setMeetingsSource("mock");
         setSelectedMeeting(mockMeetings[0] || null);
-        return;
+      } else {
+        const normalizedMeetings = meetingsData.map(normalizeMeeting);
+        setMeetings(normalizedMeetings);
+        setMeetingsSource("supabase");
+        setSelectedMeeting(normalizedMeetings[0] || null);
       }
 
-      const normalized = data.map(normalizeMeeting);
-      setMeetings(normalized);
-      setMeetingsSource("supabase");
-      setSelectedMeeting(normalized[0] || null);
+      const { data: tasksData, error: tasksError } = tasksRes;
+      if (tasksError || !Array.isArray(tasksData) || tasksData.length === 0) {
+        setTasks(mockTasks);
+        setTasksSource("mock");
+      } else {
+        setTasks(normalizeTasks(tasksData));
+        setTasksSource("supabase");
+      }
     }
 
-    loadMeetings();
+    loadData();
 
     return () => {
       cancelled = true;
@@ -362,10 +389,10 @@ function App() {
             <motion.section key="board" className="kanban" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               {Object.entries(tasks).map(([column, items]) => (
                 <div key={column} className="glass-card column" onDragOver={(e) => e.preventDefault()} onDrop={() => setDragging(null)}>
-                  <PanelTitle title={columnLabel(column)} subtitle={`${items.length} cards`} />
+                  <PanelTitle title={`${columnLabel(column)}${column === "todo" ? ` · ${tasksSource}` : ""}`} subtitle={`${items.length} cards`} />
                   <div className="task-list">
                     {items.map((task) => (
-                      <div key={task.title} draggable className={`task-card ${dragging === task.title ? "dragging" : ""}`} onDragStart={() => setDragging(task.title)} onDragEnd={() => setDragging(null)}>
+                      <div key={task.id || task.title} draggable className={`task-card ${dragging === (task.id || task.title) ? "dragging" : ""}`} onDragStart={() => setDragging(task.id || task.title)} onDragEnd={() => setDragging(null)}>
                         <div className="task-top">
                           <strong>{task.title}</strong>
                           <span className={`priority ${task.priority}`}>{task.priority}</span>
