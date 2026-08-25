@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import ReactDOM from "react-dom/client";
-import { format, isAfter, parseISO, subDays } from "date-fns";
+import { format, formatDistanceToNow, isAfter, isBefore, parseISO, subDays } from "date-fns";
 import DOMPurify from "dompurify";
 import { AnimatePresence, motion } from "framer-motion";
 import {
@@ -9,14 +9,18 @@ import {
   CheckSquare,
   ChevronDown,
   ChevronRight,
+  CircleUserRound,
   Clock,
   Globe,
   MessageSquareMore,
+  Plus,
   Search,
   Send,
   Sparkles,
+  Trash2,
   TrendingUp,
   Users,
+  X,
   Wand2,
 } from "lucide-react";
 import {
@@ -94,6 +98,31 @@ const councils = [
   },
 ];
 
+const integrationGuide = {
+  overview: [
+    "Use the Kanban API as the system of record for task lifecycle updates.",
+    "Treat meetings as a separate Supabase-backed domain until they get their own API facade.",
+    "Keep auth and agent identity distinct from task payloads so agents can self-register cleanly.",
+  ],
+  endpoints: [
+    { requestType: "task", actions: ["list", "get", "create", "update", "delete"] },
+    { requestType: "assignee", actions: ["list", "assign", "unassign"] },
+    { requestType: "subtask", actions: ["create", "update", "delete"] },
+    { requestType: "question", actions: ["ask"] },
+  ],
+  rules: [
+    "Columns use the API contract: to_do, doing, needs_input, done, canceled.",
+    "Priorities use: Low, Medium, High, Urgent.",
+    "Agents should send agent_name and agent_emoji with task mutations.",
+    "Use the webhook-protected API path in development via /api/ai-tasks.",
+  ],
+  nextDocs: [
+    "Document agent self-registration flow against the agents table.",
+    "Add payload examples for task updates, assignee updates, and blocking questions.",
+    "Explain how humans and agents are represented in-platform.",
+  ],
+};
+
 const meetingTypes = {
   standup: "#818cf8",
   "1-on-1": "#60a5fa",
@@ -141,13 +170,18 @@ const mockTasks = {
   canceled: [],
 };
 
-const emptyTaskColumns = {
-  to_do: [],
-  doing: [],
-  needs_input: [],
-  done: [],
-  canceled: [],
-};
+const KANBAN_COLUMNS = [
+  { key: "to_do", name: "To Do", color: "#ef4444" },
+  { key: "doing", name: "Doing", color: "#f59e0b" },
+  { key: "needs_input", name: "Needs Input", color: "#8b5cf6" },
+  { key: "done", name: "Done", color: "#10b981" },
+  { key: "canceled", name: "Canceled", color: "#6b7280" },
+];
+
+const emptyTaskColumns = KANBAN_COLUMNS.reduce((acc, column) => {
+  acc[column.key] = [];
+  return acc;
+}, {});
 
 async function callClawBuddyApi(body) {
   if (!CLAWBUDDY_API_URL) {
@@ -182,6 +216,9 @@ function toBoardColumn(status) {
 
 function normalizeTaskRecord(task) {
   const status = toBoardColumn(task.column || task.status);
+  const assignees = Array.isArray(task.assignees) ? task.assignees : [];
+  const subtasks = Array.isArray(task.subtasks) ? task.subtasks : [];
+  const completedSubtasks = subtasks.filter((item) => item.completed).length;
   return {
     ...task,
     id: task.id,
@@ -191,6 +228,13 @@ function normalizeTaskRecord(task) {
     priority: task.priority ? `${task.priority}`.replace(/^./, (c) => c.toUpperCase()) : task.priority,
     status,
     progress: task.progress ?? null,
+    due_date: task.due_date ?? null,
+    assignees,
+    subtasks,
+    completedSubtasks,
+    boardColor: task.board_column_color || KANBAN_COLUMNS.find((column) => column.key === status)?.color,
+    boardName: task.board_column_name || columnLabel(status),
+    position: task.position ?? task.sort_order ?? 0,
   };
 }
 
@@ -231,6 +275,11 @@ function App() {
   const [newTaskDescription, setNewTaskDescription] = useState("");
   const [newTaskPriority, setNewTaskPriority] = useState("Medium");
   const [dragging, setDragging] = useState(null);
+  const [mobileBoardTab, setMobileBoardTab] = useState("to_do");
+  const [selectedTaskId, setSelectedTaskId] = useState(null);
+  const [taskDraft, setTaskDraft] = useState(null);
+  const [newAssigneeName, setNewAssigneeName] = useState("");
+  const [newSubtaskTitle, setNewSubtaskTitle] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -270,8 +319,27 @@ function App() {
 
     loadData();
 
+    if (!supabase) {
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const taskTables = ["tasks", "subtasks", "task_subtasks", "task_assignees", "task_assignees_v2"];
+    const channels = taskTables.map((table) =>
+      supabase
+        .channel(`board-${table}`)
+        .on("postgres_changes", { event: "*", schema: "public", table }, async () => {
+          if (!cancelled) await refreshTasks();
+        })
+        .subscribe()
+    );
+
     return () => {
       cancelled = true;
+      channels.forEach((channel) => {
+        supabase.removeChannel(channel);
+      });
     };
   }, []);
 
@@ -306,22 +374,92 @@ function App() {
   }
 
   async function moveTask(taskId, column) {
+    const ordered = tasks[column] || [];
     await callClawBuddyApi({
       request_type: "task",
       action: "update",
       task_id: taskId,
       column,
+      position: ordered.length + 1,
     });
     await refreshTasks();
   }
 
-  async function assignTask(taskId) {
+  async function assignTask(taskId, names = [DEFAULT_AGENT_NAME]) {
     await callClawBuddyApi({
       request_type: "assignee",
       action: "assign",
       task_id: taskId,
-      names: [DEFAULT_AGENT_NAME],
+      names,
     });
+    await refreshTasks();
+  }
+
+  async function unassignTask(taskId, name) {
+    await callClawBuddyApi({
+      request_type: "assignee",
+      action: "unassign",
+      task_id: taskId,
+      names: [name],
+    });
+    await refreshTasks();
+  }
+
+  async function saveTaskDraft() {
+    if (!taskDraft?.id) return;
+    await callClawBuddyApi({
+      request_type: "task",
+      action: "update",
+      task_id: taskDraft.id,
+      title: taskDraft.title,
+      description: taskDraft.description,
+      priority: taskDraft.priority,
+      column: taskDraft.status,
+      due_date: taskDraft.due_date || null,
+    });
+    await refreshTasks();
+  }
+
+  async function deleteTask(taskId) {
+    const confirmed = window.confirm("Delete this task?");
+    if (!confirmed) return;
+    await callClawBuddyApi({ request_type: "task", action: "delete", task_id: taskId });
+    setSelectedTaskId(null);
+    setTaskDraft(null);
+    await refreshTasks();
+  }
+
+  async function addSubtask() {
+    if (!selectedTaskId || !newSubtaskTitle.trim()) return;
+    await callClawBuddyApi({
+      request_type: "subtask",
+      action: "create",
+      task_id: selectedTaskId,
+      title: newSubtaskTitle,
+      completed: false,
+    });
+    setNewSubtaskTitle("");
+    await refreshTasks();
+  }
+
+  async function toggleSubtask(subtask) {
+    await callClawBuddyApi({
+      request_type: "subtask",
+      action: "update",
+      subtask_id: subtask.id,
+      title: subtask.title,
+      completed: !subtask.completed,
+    });
+    await refreshTasks();
+  }
+
+  async function deleteSubtask(subtaskId) {
+    await callClawBuddyApi({
+      request_type: "subtask",
+      action: "delete",
+      subtask_id: subtaskId,
+    });
+    await refreshTasks();
   }
 
   const counts = useMemo(() => {
@@ -380,6 +518,25 @@ function App() {
 
   const categories = ["all", "observation", "general", "reminder", "fyi"];
 
+  const boardTaskCount = useMemo(() => Object.values(tasks).reduce((sum, items) => sum + items.length, 0), [tasks]);
+  const allTasks = useMemo(() => Object.values(tasks).flat(), [tasks]);
+  const selectedTask = useMemo(() => allTasks.find((task) => task.id === selectedTaskId) || null, [allTasks, selectedTaskId]);
+
+  useEffect(() => {
+    if (!selectedTask) {
+      setTaskDraft(null);
+      return;
+    }
+    setTaskDraft({
+      id: selectedTask.id,
+      title: selectedTask.title || "",
+      description: selectedTask.description || "",
+      priority: selectedTask.priority || "Medium",
+      status: selectedTask.status || "to_do",
+      due_date: selectedTask.due_date || "",
+    });
+  }, [selectedTask]);
+
   return (
     <div className="app-shell">
       <div className="aurora" />
@@ -409,6 +566,7 @@ function App() {
           ["deck", "Command Deck"],
           ["agents", "Agents"],
           ["board", "Task Board"],
+          ["guide", "Integration Guide"],
           ["log", "AI Log"],
           ["council", "Council"],
           ["meetings", "Meetings"],
@@ -491,49 +649,309 @@ function App() {
 
           {tab === "board" && (
             <motion.section key="board" className="stack" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-              <div className="glass-card panel filters">
-                <PanelTitle title={`Task Board · ${tasksSource}`} subtitle="Create and manage ClawBuddy tasks" />
-                <div className="filters-row">
-                  <input className="select" value={newTaskTitle} onChange={(e) => setNewTaskTitle(e.target.value)} placeholder="New task title" />
-                  <input className="select" value={newTaskDescription} onChange={(e) => setNewTaskDescription(e.target.value)} placeholder="Description" />
-                  <select className="select" value={newTaskPriority} onChange={(e) => setNewTaskPriority(e.target.value)}>
+              <section className="glass-card board-shell">
+                <div className="board-header-row">
+                  <div>
+                    <p className="eyebrow">Workspace</p>
+                    <h2 className="board-title">Board</h2>
+                    <p className="muted">Full task flow powered by {tasksSource === "api" ? "the ClawBuddy API" : "mock fallback data"} · {boardTaskCount} tasks</p>
+                  </div>
+                  <button className="primary-btn" onClick={createTask}>
+                    <Plus size={16} />
+                    <span>+ New Task</span>
+                  </button>
+                </div>
+
+                <div className="board-composer">
+                  <input className="select board-input" value={newTaskTitle} onChange={(e) => setNewTaskTitle(e.target.value)} placeholder="Task title" />
+                  <input className="select board-input" value={newTaskDescription} onChange={(e) => setNewTaskDescription(e.target.value)} placeholder="Short description" />
+                  <select className="select board-select" value={newTaskPriority} onChange={(e) => setNewTaskPriority(e.target.value)}>
                     <option value="Low">Low</option>
                     <option value="Medium">Medium</option>
                     <option value="High">High</option>
                     <option value="Urgent">Urgent</option>
                   </select>
-                  <button className="secondary-btn" onClick={createTask}>Create Task</button>
                 </div>
-              </div>
-              <motion.section className="kanban" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-                {Object.entries(tasks).map(([column, items]) => (
-                  <div key={column} className="glass-card column" onDragOver={(e) => e.preventDefault()} onDrop={async () => {
-                    if (dragging) {
-                      await moveTask(dragging, column);
-                      setDragging(null);
-                    }
-                  }}>
-                    <PanelTitle title={columnLabel(column)} subtitle={`${items.length} cards`} />
-                    <div className="task-list">
-                      {items.map((task) => (
-                        <div key={task.id || task.title} draggable className={`task-card ${dragging === (task.id || task.title) ? "dragging" : ""}`} onDragStart={() => setDragging(task.id || task.title)} onDragEnd={() => setDragging(null)}>
-                          <div className="task-top">
-                            <strong>{task.title}</strong>
-                            <span className={`priority ${String(task.priority || "").toLowerCase()}`}>{task.priority}</span>
+
+                <div className="board-mobile-tabs">
+                  {KANBAN_COLUMNS.map((column) => (
+                    <button
+                      key={column.key}
+                      className={`board-mobile-tab ${mobileBoardTab === column.key ? "active" : ""}`}
+                      onClick={() => setMobileBoardTab(column.key)}
+                    >
+                      {column.name}
+                    </button>
+                  ))}
+                </div>
+
+                <motion.section className="kanban kanban-phase-two" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                  {KANBAN_COLUMNS.map((column) => {
+                    const items = tasks[column.key] || [];
+                    return (
+                      <div
+                        key={column.key}
+                        className={`glass-card board-column ${mobileBoardTab === column.key ? "mobile-active" : ""}`}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={async () => {
+                          if (dragging) {
+                            await moveTask(dragging, column.key);
+                            setDragging(null);
+                          }
+                        }}
+                      >
+                        <div className="board-column-topbar" style={{ background: column.color }} />
+                        <div className="board-column-header">
+                          <div className="board-column-title-wrap" style={{ borderLeftColor: column.color }}>
+                            <h3>{column.name}</h3>
+                            <p className="muted">{column.key === "needs_input" ? "Waiting on human input" : column.key === "doing" ? "Currently in motion" : column.key === "done" ? "Completed work" : column.key === "canceled" ? "Intentionally stopped" : "Ready to pick up"}</p>
                           </div>
-                          <div className="task-bottom">
-                            <span className="emoji">{task.agent}</span>
-                            <div style={{ display: "flex", gap: 8 }}>
-                              <button className="secondary-btn" onClick={() => assignTask(task.id)}>Assign</button>
+                          <span className="count-badge">{items.length}</span>
+                        </div>
+                        <div className="board-column-body">
+                          {items.length === 0 ? (
+                            <div className="empty-column">
+                              <CircleUserRound size={18} />
+                              <span>No tasks</span>
                             </div>
-                            {task.progress != null && <span className="muted">{task.progress}% complete</span>}
+                          ) : (
+                            items
+                              .slice()
+                              .sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+                              .map((task) => (
+                                <button
+                                  key={task.id || task.title}
+                                  draggable
+                                  type="button"
+                                  className={`task-card kanban-task-card ${dragging === (task.id || task.title) ? "dragging" : ""}`}
+                                  onDragStart={() => setDragging(task.id || task.title)}
+                                  onDragEnd={() => setDragging(null)}
+                                  onClick={() => setSelectedTaskId(task.id)}
+                                  aria-label={`Open task ${task.title}`}
+                                >
+                                  <div className="task-card-head">
+                                    <strong className="task-card-title">{task.title}</strong>
+                                    <span className={`priority-badge ${String(task.priority || "").toLowerCase()}`}>{task.priority}</span>
+                                  </div>
+
+                                  {task.description ? <p className="task-description-preview">{task.description}</p> : null}
+
+                                  <div className="task-meta-row">
+                                    <AssigneeStack assignees={task.assignees} />
+                                    <button
+                                      className="inline-assign-btn"
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        assignTask(task.id);
+                                      }}
+                                    >
+                                      Assign
+                                    </button>
+                                  </div>
+
+                                  <div className="task-meta-row task-meta-bottom">
+                                    <div className="task-due-wrap">
+                                      {task.due_date ? <DueDate dueDate={task.due_date} /> : null}
+                                    </div>
+                                    {task.progress != null ? <span className="muted">{task.progress}% complete</span> : null}
+                                  </div>
+
+                                  {task.subtasks?.length ? (
+                                    <div className="subtask-progress-wrap">
+                                      <div className="subtask-progress-label">
+                                        <span>{task.completedSubtasks}/{task.subtasks.length} subtasks</span>
+                                      </div>
+                                      <div className="subtask-progress-bar">
+                                        <span style={{ width: `${Math.round((task.completedSubtasks / task.subtasks.length) * 100)}%` }} />
+                                      </div>
+                                    </div>
+                                  ) : null}
+                                </button>
+                              ))
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </motion.section>
+
+                <AnimatePresence>
+                  {selectedTask && taskDraft ? (
+                    <motion.aside
+                      className="task-drawer-backdrop"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                    >
+                      <motion.div
+                        className="glass-card task-drawer"
+                        initial={{ x: 30, opacity: 0 }}
+                        animate={{ x: 0, opacity: 1 }}
+                        exit={{ x: 30, opacity: 0 }}
+                      >
+                        <div className="task-drawer-head">
+                          <div>
+                            <p className="eyebrow">Task detail</p>
+                            <h3>{selectedTask.title}</h3>
+                          </div>
+                          <button className="icon-btn" type="button" onClick={() => setSelectedTaskId(null)}>
+                            <X size={16} />
+                          </button>
+                        </div>
+
+                        <div className="task-drawer-body">
+                          <label className="drawer-field">
+                            <span>Title</span>
+                            <input className="select" value={taskDraft.title} onChange={(e) => setTaskDraft((current) => ({ ...current, title: e.target.value }))} />
+                          </label>
+
+                          <label className="drawer-field">
+                            <span>Description</span>
+                            <textarea className="select drawer-textarea" value={taskDraft.description} onChange={(e) => setTaskDraft((current) => ({ ...current, description: e.target.value }))} />
+                          </label>
+
+                          <div className="drawer-grid">
+                            <label className="drawer-field">
+                              <span>Priority</span>
+                              <select className="select" value={taskDraft.priority} onChange={(e) => setTaskDraft((current) => ({ ...current, priority: e.target.value }))}>
+                                <option value="Low">Low</option>
+                                <option value="Medium">Medium</option>
+                                <option value="High">High</option>
+                                <option value="Urgent">Urgent</option>
+                              </select>
+                            </label>
+
+                            <label className="drawer-field">
+                              <span>Column</span>
+                              <select className="select" value={taskDraft.status} onChange={(e) => setTaskDraft((current) => ({ ...current, status: e.target.value }))}>
+                                {KANBAN_COLUMNS.map((column) => <option key={column.key} value={column.key}>{column.name}</option>)}
+                              </select>
+                            </label>
+
+                            <label className="drawer-field">
+                              <span>Due date</span>
+                              <input className="select" type="date" value={taskDraft.due_date || ""} onChange={(e) => setTaskDraft((current) => ({ ...current, due_date: e.target.value }))} />
+                            </label>
+                          </div>
+
+                          <div className="drawer-section">
+                            <div className="drawer-section-head">
+                              <h4>Assignees</h4>
+                            </div>
+                            <div className="assignee-chip-row">
+                              {selectedTask.assignees?.length ? selectedTask.assignees.map((assignee) => {
+                                const name = assignee.display_name || assignee.name;
+                                return (
+                                  <button key={assignee.id || name} className="assignee-pill" type="button" onClick={() => unassignTask(selectedTask.id, name)}>
+                                    {name} <X size={12} />
+                                  </button>
+                                );
+                              }) : <span className="muted">No assignees yet</span>}
+                            </div>
+                            <div className="drawer-inline-form">
+                              <input className="select" value={newAssigneeName} onChange={(e) => setNewAssigneeName(e.target.value)} placeholder="Add assignee by name" />
+                              <button
+                                className="secondary-btn"
+                                type="button"
+                                onClick={async () => {
+                                  if (!newAssigneeName.trim()) return;
+                                  await assignTask(selectedTask.id, [newAssigneeName.trim()]);
+                                  setNewAssigneeName("");
+                                }}
+                              >
+                                Add
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="drawer-section">
+                            <div className="drawer-section-head">
+                              <h4>Subtasks</h4>
+                            </div>
+                            <div className="subtask-list-drawer">
+                              {selectedTask.subtasks?.length ? selectedTask.subtasks.map((subtask) => (
+                                <label key={subtask.id} className="subtask-row">
+                                  <input type="checkbox" checked={!!subtask.completed} onChange={() => toggleSubtask(subtask)} />
+                                  <span>{subtask.title}</span>
+                                  <button type="button" className="icon-btn subtle" onClick={() => deleteSubtask(subtask.id)}>
+                                    <Trash2 size={14} />
+                                  </button>
+                                </label>
+                              )) : <span className="muted">No subtasks yet</span>}
+                            </div>
+                            <div className="drawer-inline-form">
+                              <input className="select" value={newSubtaskTitle} onChange={(e) => setNewSubtaskTitle(e.target.value)} placeholder="Add subtask" />
+                              <button className="secondary-btn" type="button" onClick={addSubtask}>Add</button>
+                            </div>
+                          </div>
+
+                          <div className="drawer-markdown-preview">
+                            <h4>Description preview</h4>
+                            <div className="summary" dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(taskDraft.description ? `<p>${taskDraft.description.replace(/\n/g, "</p><p>")}</p>` : "<p>No description yet.</p>") }} />
                           </div>
                         </div>
-                      ))}
-                    </div>
+
+                        <div className="task-drawer-actions">
+                          <button className="secondary-btn" type="button" onClick={saveTaskDraft}>Save changes</button>
+                          <button className="danger-btn" type="button" onClick={() => deleteTask(selectedTask.id)}>
+                            <Trash2 size={14} /> Delete task
+                          </button>
+                        </div>
+                      </motion.div>
+                    </motion.aside>
+                  ) : null}
+                </AnimatePresence>
+              </section>
+            </motion.section>
+          )}
+
+          {tab === "guide" && (
+            <motion.section key="guide" className="stack" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <section className="glass-card panel guide-hero">
+                <p className="eyebrow">Docs in progress</p>
+                <h2 className="board-title">Integration Guide</h2>
+                <p className="muted">Build the platform and its API contract side by side. This page is the in-app source of truth for how humans, agents, and Kanban mutations are expected to work.</p>
+              </section>
+
+              <section className="guide-grid">
+                <div className="glass-card panel">
+                  <PanelTitle title="Kanban API overview" subtitle="What agents should assume today" />
+                  <div className="guide-list">
+                    {integrationGuide.overview.map((item) => <p key={item}>{item}</p>)}
                   </div>
-                ))}
-              </motion.section>
+                </div>
+
+                <div className="glass-card panel">
+                  <PanelTitle title="Rules" subtitle="Stable contract decisions" />
+                  <div className="guide-list">
+                    {integrationGuide.rules.map((item) => <p key={item}>{item}</p>)}
+                  </div>
+                </div>
+              </section>
+
+              <section className="guide-grid guide-grid-2">
+                <div className="glass-card panel">
+                  <PanelTitle title="Endpoint map" subtitle="Current request types and actions" />
+                  <div className="guide-endpoints">
+                    {integrationGuide.endpoints.map((endpoint) => (
+                      <div key={endpoint.requestType} className="guide-endpoint-card">
+                        <strong>{endpoint.requestType}</strong>
+                        <div className="chips">
+                          {endpoint.actions.map((action) => <span key={action} className="chip">{action}</span>)}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="glass-card panel">
+                  <PanelTitle title="Next docs to write" subtitle="Parallel work queue" />
+                  <div className="guide-list">
+                    {integrationGuide.nextDocs.map((item) => <p key={item}>{item}</p>)}
+                  </div>
+                </div>
+              </section>
             </motion.section>
           )}
 
@@ -767,6 +1185,59 @@ function columnLabel(value) {
     done: "Done",
     canceled: "Canceled",
   }[value];
+}
+
+function DueDate({ dueDate }) {
+  const parsed = parseISO(`${dueDate}T00:00:00`);
+  const overdue = isBefore(parsed, new Date());
+  return (
+    <span className={`due-date ${overdue ? "overdue" : ""}`}>
+      <Calendar size={14} />
+      {formatDistanceToNow(parsed, { addSuffix: true })}
+    </span>
+  );
+}
+
+function AssigneeStack({ assignees }) {
+  if (!assignees?.length) {
+    return (
+      <div className="assignee-stack empty">
+        <span className="assignee-fallback"><CircleUserRound size={14} /></span>
+      </div>
+    );
+  }
+
+  const visible = assignees.slice(0, 3);
+  const overflow = assignees.length - visible.length;
+
+  return (
+    <div className="assignee-stack">
+      {visible.map((assignee) => {
+        const label = assignee.display_name || assignee.name || "User";
+        return (
+          <span key={`${assignee.id || label}`} className="assignee-avatar" style={{ background: stringToColor(label) }}>
+            {initials(label)}
+          </span>
+        );
+      })}
+      {overflow > 0 ? <span className="assignee-avatar overflow">+{overflow}</span> : null}
+    </div>
+  );
+}
+
+function initials(value) {
+  return String(value)
+    .split(" ")
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+}
+
+function stringToColor(value) {
+  const palette = ["#2563eb", "#7c3aed", "#db2777", "#0891b2", "#059669", "#ea580c"];
+  const hash = String(value).split("").reduce((acc, char) => acc + char.charCodeAt(0), 0);
+  return palette[hash % palette.length];
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);

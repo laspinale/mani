@@ -14,13 +14,15 @@ create index if not exists tasks_status_idx on public.tasks (status, sort_order)
 
 alter table public.tasks enable row level security;
 
-create policy if not exists "anon can select tasks"
+drop policy if exists "anon can select tasks" on public.tasks;
+create policy "anon can select tasks"
   on public.tasks
   for select
   to anon
   using (true);
 
-create policy if not exists "anon can update tasks"
+drop policy if exists "anon can update tasks" on public.tasks;
+create policy "anon can update tasks"
   on public.tasks
   for update
   to anon
