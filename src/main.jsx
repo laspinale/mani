@@ -146,7 +146,7 @@ function normalizeMeeting(meeting) {
 }
 
 function App() {
-  const [tab, setTab] = useState("deck");
+  const [tab, setTab] = useState("meetings");
   const [logFilter, setLogFilter] = useState("all");
   const [expandedCouncil, setExpandedCouncil] = useState(0);
   const [search, setSearch] = useState("");
@@ -209,21 +209,16 @@ function App() {
       openItems: filtered.reduce((sum, m) => sum + m.action_items.filter((a) => !a.done).length, 0),
       avgDuration: filtered.length ? Math.round(filtered.reduce((sum, m) => sum + m.duration_minutes, 0) / filtered.length) : 0,
     };
-  }, [search, hasActionItems, externalOnly, selectedTypes, dateRange]);
+  }, [meetings, search, hasActionItems, externalOnly, selectedTypes, dateRange]);
 
   const pieData = useMemo(() => {
-    const data = [
-      { name: "1-on-1", value: 2 },
-      { name: "external", value: 2 },
-      { name: "sales", value: 2 },
-      { name: "team", value: 1 },
-      { name: "standup", value: 2 },
-      { name: "planning", value: 1 },
-      { name: "interview", value: 1 },
-      { name: "allhands", value: 1 },
-    ];
-    return data;
-  }, []);
+    const countsByType = meetings.reduce((acc, meeting) => {
+      acc[meeting.meeting_type] = (acc[meeting.meeting_type] || 0) + 1;
+      return acc;
+    }, {});
+
+    return Object.entries(countsByType).map(([name, value]) => ({ name, value }));
+  }, [meetings]);
 
   const barData = useMemo(() => {
     const months = {};
@@ -232,7 +227,7 @@ function App() {
       months[key] = (months[key] || 0) + 1;
     });
     return Object.entries(months).map(([month, total]) => ({ month, total }));
-  }, []);
+  }, [meetings]);
 
   const filteredMeetings = useMemo(() => {
     return [...meetings]
@@ -250,7 +245,7 @@ function App() {
         if (sortBy === "longest") return b.duration_minutes - a.duration_minutes;
         return new Date(b.date) - new Date(a.date);
       });
-  }, [search, hasActionItems, externalOnly, selectedTypes, dateRange, sortBy]);
+  }, [meetings, search, hasActionItems, externalOnly, selectedTypes, dateRange, sortBy]);
 
   const categories = ["all", "observation", "general", "reminder", "fyi"];
 
@@ -271,10 +266,10 @@ function App() {
           <span className="status-dot active" />
           <span className="pill">Meetings: {meetingsSource}</span>
           <div>
-            <strong>{agents[0].name}: Online</strong>
-            <div>{agents[0].activity}</div>
+            <strong>Meetings backend: {meetingsSource === "supabase" ? "Supabase" : "Mock fallback"}</strong>
+            <div>{meetingsSource === "supabase" ? "Live meetings loaded from remote data" : "Using local fallback meetings data"}</div>
           </div>
-          <div className="muted">Last seen: {agents[0].lastSeen}</div>
+          <div className="muted">Rows loaded: {meetings.length}</div>
         </div>
       </header>
 
