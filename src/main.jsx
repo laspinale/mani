@@ -34,6 +34,10 @@ import {
 import "./styles.css";
 import { supabase } from "./lib/supabase";
 
+const CLAWBUDDY_API_URL = import.meta.env.DEV ? "/api/ai-tasks" : `${import.meta.env.VITE_CLAWBUDDY_API_URL}/functions/v1/ai-tasks`;
+const DEFAULT_AGENT_NAME = import.meta.env.VITE_AGENT_NAME || "Agent Alpha";
+const DEFAULT_AGENT_EMOJI = import.meta.env.VITE_AGENT_EMOJI || "🤖";
+
 const agents = [
   { name: "Agent Alpha", emoji: "🤖", type: "Code Agent", role: "Lead Engineer", accent: "#10b981", status: "active", activity: "Refactoring task queue", lastSeen: "just now", tasksCompleted: 128, accuracy: 98.4, skills: ["TypeScript", "Architecture", "Reviews"] },
   { name: "Dispatch Bot", emoji: "📋", type: "Coordinator", role: "Operations Director", accent: "#f59e0b", status: "idle", activity: "Waiting on next dispatch", lastSeen: "3m ago", tasksCompleted: 84, accuracy: 94.8, skills: ["Scheduling", "Routing", "Planning"] },
@@ -116,38 +120,85 @@ const mockMeetings = [
 ];
 
 const mockTasks = {
-  todo: [
-    { title: "Draft onboarding checklist", agent: "📋", priority: "medium", status: "todo" },
-    { title: "Audit security logging", agent: "🛡️", priority: "high", status: "todo" },
-    { title: "Create release summary", agent: "🤖", priority: "low", status: "todo" },
+  to_do: [
+    { title: "Draft onboarding checklist", agent: "📋", priority: "Medium", status: "to_do" },
+    { title: "Audit security logging", agent: "🛡️", priority: "High", status: "to_do" },
+    { title: "Create release summary", agent: "🤖", priority: "Low", status: "to_do" },
   ],
   doing: [
-    { title: "Refactor task assignment flow", agent: "🤖", priority: "urgent", progress: 72, status: "doing" },
-    { title: "Sync council transcript", agent: "📋", priority: "medium", progress: 44, status: "doing" },
+    { title: "Refactor task assignment flow", agent: "🤖", priority: "Urgent", progress: 72, status: "doing" },
+    { title: "Sync council transcript", agent: "📋", priority: "Medium", progress: 44, status: "doing" },
   ],
-  needsInput: [
-    { title: "Clarify KPI target for Q3", agent: "📋", priority: "high", status: "needsInput" },
-    { title: "Approve policy exception", agent: "🛡️", priority: "urgent", status: "needsInput" },
+  needs_input: [
+    { title: "Clarify KPI target for Q3", agent: "📋", priority: "High", status: "needs_input" },
+    { title: "Approve policy exception", agent: "🛡️", priority: "Urgent", status: "needs_input" },
   ],
   done: [
-    { title: "Ship dashboard metrics", agent: "🤖", priority: "low", status: "done" },
-    { title: "Summarize last meetings", agent: "🛡️", priority: "medium", status: "done" },
-    { title: "Rebalance task queue", agent: "📋", priority: "medium", status: "done" },
+    { title: "Ship dashboard metrics", agent: "🤖", priority: "Low", status: "done" },
+    { title: "Summarize last meetings", agent: "🛡️", priority: "Medium", status: "done" },
+    { title: "Rebalance task queue", agent: "📋", priority: "Medium", status: "done" },
   ],
+  canceled: [],
 };
 
 const emptyTaskColumns = {
-  todo: [],
+  to_do: [],
   doing: [],
-  needsInput: [],
+  needs_input: [],
   done: [],
+  canceled: [],
 };
+
+async function callClawBuddyApi(body) {
+  if (!CLAWBUDDY_API_URL) {
+    throw new Error("Missing ClawBuddy API configuration");
+  }
+
+  const response = await fetch(CLAWBUDDY_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      agent_name: DEFAULT_AGENT_NAME,
+      agent_emoji: DEFAULT_AGENT_EMOJI,
+      ...body,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `ClawBuddy API error ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function toBoardColumn(status) {
+  if (status === "todo") return "to_do";
+  if (status === "needsInput") return "needs_input";
+  return status;
+}
+
+function normalizeTaskRecord(task) {
+  const status = toBoardColumn(task.column || task.status);
+  return {
+    ...task,
+    id: task.id,
+    title: task.title,
+    description: task.description,
+    agent: task.agent || task.agent_name || DEFAULT_AGENT_EMOJI,
+    priority: task.priority ? `${task.priority}`.replace(/^./, (c) => c.toUpperCase()) : task.priority,
+    status,
+    progress: task.progress ?? null,
+  };
+}
 
 function normalizeTasks(rows) {
   return rows.reduce((acc, task) => {
-    const status = task.status;
-    if (!acc[status]) acc[status] = [];
-    acc[status].push(task);
+    const normalized = normalizeTaskRecord(task);
+    if (!acc[normalized.status]) acc[normalized.status] = [];
+    acc[normalized.status].push(normalized);
     return acc;
   }, { ...emptyTaskColumns });
 }
@@ -176,18 +227,22 @@ function App() {
   const [selectedMeeting, setSelectedMeeting] = useState(mockMeetings[0] || null);
   const [tasks, setTasks] = useState(mockTasks);
   const [tasksSource, setTasksSource] = useState("mock");
+  const [newTaskTitle, setNewTaskTitle] = useState("");
+  const [newTaskDescription, setNewTaskDescription] = useState("");
+  const [newTaskPriority, setNewTaskPriority] = useState("Medium");
   const [dragging, setDragging] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
 
     async function loadData() {
-      if (!supabase) return;
+      const meetingsPromise = supabase
+        ? supabase.from("meetings").select("*").order("date", { ascending: false })
+        : Promise.resolve({ data: null, error: new Error("Supabase unavailable") });
 
-      const [meetingsRes, tasksRes] = await Promise.all([
-        supabase.from("meetings").select("*").order("date", { ascending: false }),
-        supabase.from("tasks").select("*").order("sort_order", { ascending: true }),
-      ]);
+      const tasksPromise = callClawBuddyApi({ request_type: "task", action: "list" }).catch((error) => ({ error }));
+
+      const [meetingsRes, tasksRes] = await Promise.all([meetingsPromise, tasksPromise]);
 
       if (cancelled) return;
 
@@ -203,13 +258,13 @@ function App() {
         setSelectedMeeting(normalizedMeetings[0] || null);
       }
 
-      const { data: tasksData, error: tasksError } = tasksRes;
-      if (tasksError || !Array.isArray(tasksData) || tasksData.length === 0) {
+      const tasksData = Array.isArray(tasksRes?.tasks) ? tasksRes.tasks : Array.isArray(tasksRes?.data) ? tasksRes.data : null;
+      if (!tasksData || tasksRes?.error) {
         setTasks(mockTasks);
         setTasksSource("mock");
       } else {
         setTasks(normalizeTasks(tasksData));
-        setTasksSource("supabase");
+        setTasksSource("api");
       }
     }
 
@@ -219,6 +274,55 @@ function App() {
       cancelled = true;
     };
   }, []);
+
+  async function refreshTasks() {
+    try {
+      const tasksRes = await callClawBuddyApi({ request_type: "task", action: "list" });
+      const tasksData = Array.isArray(tasksRes?.tasks) ? tasksRes.tasks : Array.isArray(tasksRes?.data) ? tasksRes.data : null;
+      if (!tasksData) throw new Error("No task data returned");
+      setTasks(normalizeTasks(tasksData));
+      setTasksSource("api");
+    } catch (error) {
+      console.error(error);
+      setTasks(mockTasks);
+      setTasksSource("mock");
+    }
+  }
+
+  async function createTask() {
+    if (!newTaskTitle.trim()) return;
+    await callClawBuddyApi({
+      request_type: "task",
+      action: "create",
+      title: newTaskTitle,
+      description: newTaskDescription,
+      column: "to_do",
+      priority: newTaskPriority,
+    });
+    setNewTaskTitle("");
+    setNewTaskDescription("");
+    setNewTaskPriority("Medium");
+    await refreshTasks();
+  }
+
+  async function moveTask(taskId, column) {
+    await callClawBuddyApi({
+      request_type: "task",
+      action: "update",
+      task_id: taskId,
+      column,
+    });
+    await refreshTasks();
+  }
+
+  async function assignTask(taskId) {
+    await callClawBuddyApi({
+      request_type: "assignee",
+      action: "assign",
+      task_id: taskId,
+      names: [DEFAULT_AGENT_NAME],
+    });
+  }
 
   const counts = useMemo(() => {
     const filtered = meetings.filter((m) => {
@@ -386,26 +490,50 @@ function App() {
           )}
 
           {tab === "board" && (
-            <motion.section key="board" className="kanban" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-              {Object.entries(tasks).map(([column, items]) => (
-                <div key={column} className="glass-card column" onDragOver={(e) => e.preventDefault()} onDrop={() => setDragging(null)}>
-                  <PanelTitle title={`${columnLabel(column)}${column === "todo" ? ` · ${tasksSource}` : ""}`} subtitle={`${items.length} cards`} />
-                  <div className="task-list">
-                    {items.map((task) => (
-                      <div key={task.id || task.title} draggable className={`task-card ${dragging === (task.id || task.title) ? "dragging" : ""}`} onDragStart={() => setDragging(task.id || task.title)} onDragEnd={() => setDragging(null)}>
-                        <div className="task-top">
-                          <strong>{task.title}</strong>
-                          <span className={`priority ${task.priority}`}>{task.priority}</span>
-                        </div>
-                        <div className="task-bottom">
-                          <span className="emoji">{task.agent}</span>
-                          {task.progress != null && <span className="muted">{task.progress}% complete</span>}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+            <motion.section key="board" className="stack" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <div className="glass-card panel filters">
+                <PanelTitle title={`Task Board · ${tasksSource}`} subtitle="Create and manage ClawBuddy tasks" />
+                <div className="filters-row">
+                  <input className="select" value={newTaskTitle} onChange={(e) => setNewTaskTitle(e.target.value)} placeholder="New task title" />
+                  <input className="select" value={newTaskDescription} onChange={(e) => setNewTaskDescription(e.target.value)} placeholder="Description" />
+                  <select className="select" value={newTaskPriority} onChange={(e) => setNewTaskPriority(e.target.value)}>
+                    <option value="Low">Low</option>
+                    <option value="Medium">Medium</option>
+                    <option value="High">High</option>
+                    <option value="Urgent">Urgent</option>
+                  </select>
+                  <button className="secondary-btn" onClick={createTask}>Create Task</button>
                 </div>
-              ))}
+              </div>
+              <motion.section className="kanban" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+                {Object.entries(tasks).map(([column, items]) => (
+                  <div key={column} className="glass-card column" onDragOver={(e) => e.preventDefault()} onDrop={async () => {
+                    if (dragging) {
+                      await moveTask(dragging, column);
+                      setDragging(null);
+                    }
+                  }}>
+                    <PanelTitle title={columnLabel(column)} subtitle={`${items.length} cards`} />
+                    <div className="task-list">
+                      {items.map((task) => (
+                        <div key={task.id || task.title} draggable className={`task-card ${dragging === (task.id || task.title) ? "dragging" : ""}`} onDragStart={() => setDragging(task.id || task.title)} onDragEnd={() => setDragging(null)}>
+                          <div className="task-top">
+                            <strong>{task.title}</strong>
+                            <span className={`priority ${String(task.priority || "").toLowerCase()}`}>{task.priority}</span>
+                          </div>
+                          <div className="task-bottom">
+                            <span className="emoji">{task.agent}</span>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button className="secondary-btn" onClick={() => assignTask(task.id)}>Assign</button>
+                            </div>
+                            {task.progress != null && <span className="muted">{task.progress}% complete</span>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </motion.section>
             </motion.section>
           )}
 
@@ -633,10 +761,11 @@ function PanelTitle({ icon: Icon, title, subtitle }) {
 
 function columnLabel(value) {
   return {
-    todo: "To Do",
+    to_do: "To Do",
     doing: "Doing",
-    needsInput: "Needs Input",
+    needs_input: "Needs Input",
     done: "Done",
+    canceled: "Canceled",
   }[value];
 }
 
